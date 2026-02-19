@@ -1,0 +1,9 @@
+.*
+!.gitignore
+minio-bin
+minio/data/*
+.env
+*.env
+processed_zips.log
+influxdb_data/*
+nginx.conf
