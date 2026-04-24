@@ -28,31 +28,46 @@ services:
       - DOCKER_INFLUXDB_INIT_BUCKET=sensor-data
     restart: always
 
-  portal:
+  stream_server:
     image: python:3.11-slim
-    container_name: web_portal
+    container_name: stream_server
     volumes:
-      - .:/app
+      - .:/app  # Mount the current directory to /app
     working_dir: /app
+    # Use 'python stream_portal.py' directly, not 'python /app/stream_portal.py'
     command: >
-      sh -c "pip install streamlit influxdb-client pandas python-dotenv && 
-             streamlit run scripts/webportal.py 
-             --server.port 8501 
-             --server.address 0.0.0.0 
-             --server.enableCORS false
-             --server.enableXsrfProtection false
-             --server.headless true"
+      sh -c "pip install flask influxdb_client python-dotenv numpy pandas boto3 python-dateutil && cp .env scripts/.env && python -u scripts/stream_portal2.py"
     ports:
-      - "8501:8501"
-    depends_on:
-      - influxdb
+      - "5000:5000"
 
   nginx:
     image: nginx:latest
     container_name: nginx_proxy
     ports:
       - "80:80"
+      - "443:443" # Add this line
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - portal
+      - /var/www/ddh-portal:/var/www/ddh-portal:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro # Add this line to give Nginx access to certs
+    restart: always
+  
+  # New service for the Web Portal API
+  portal_backend:
+    image: node:20-slim # Using Node.js for better Clerk/MongoDB integration
+    container_name: portal_api
+    working_dir: /app
+    volumes:
+      - ./webportal-backend/:/app
+      - ./env:/app/.env
+    environment:
+      - MONGO_URI=${MONGO_URI}
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=${INFLUXDB_ROOT_TOKEN}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    command: sh -c "npm install && npm start"
+    ports:
+      - "3001:3001"
+    restart: always

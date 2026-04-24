@@ -7,3 +7,7 @@ minio/data/*
 processed_zips.log
 influxdb_data/*
 nginx.conf
+webportal/*
+webportal-backend/*
+applications/
+*__pycache__*

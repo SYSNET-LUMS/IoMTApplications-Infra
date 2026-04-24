@@ -2,145 +2,247 @@ import io
 import os
 import json
 import zipfile
-import pandas as pd
+import argparse
+
 import boto3
-from influxdb_client import InfluxDBClient, Point, WritePrecision, WriteOptions
-from influxdb_client.client.write_api import SYNCHRONOUS
+import pandas as pd
+import dateutil.parser
 from dotenv import load_dotenv
+from influxdb_client import InfluxDBClient, WriteOptions
+
 load_dotenv()
 
-SERVER_IP = os.getenv("SERVER_IP")
-MINIO_PORT_API = os.getenv("MINIO_PORT_API")
-MINIO_ROOT_USER = os.getenv("MINIO_ROOT_USER")
-MINIO_ROOT_PASSWORD = os.getenv("MINIO_ROOT_PASSWORD")
-INFLUXDB_PORT = os.getenv("INFLUXDB_PORT")
-INFLUXDB_ROOT_TOKEN = os.getenv("INFLUXDB_ROOT_TOKEN")
+# --- CONFIG ---
+START_FILTER_DATE = pd.to_datetime("2026-02-24").tz_localize("UTC")
+MAPPING_FILE = "mappings.json"
+LOG_FILE = "processed_zips.log"
+BUCKET_NAME = "class-data"
 
-HISTORY_FILE = "processed_zips.log"
-MINIO_BUCKET = "class-data"
-
-# --- CONFIGURATION ---
-MINIO_CONFIG = {
-    "endpoint": f"http://{SERVER_IP}:{MINIO_PORT_API}",
-    "access_key": f"{MINIO_ROOT_USER}",
-    "secret_key": f"{MINIO_ROOT_PASSWORD}",
-    "bucket": "class-data"
-}
-
-INFLUX_CONFIG = {
-    "url": f"http://{SERVER_IP}:{INFLUXDB_PORT}",
-    "token": f"{INFLUXDB_ROOT_TOKEN}",
-    "org": "my-class",
-    "bucket": "sensor-data"
-}
-
-s3 = boto3.client('s3', 
-    endpoint_url=MINIO_CONFIG["endpoint"],
-    aws_access_key_id=MINIO_CONFIG["access_key"],
-    aws_secret_access_key=MINIO_CONFIG["secret_key"]
+s3 = boto3.client(
+    "s3",
+    endpoint_url=f"http://{os.getenv('SERVER_IP')}:{os.getenv('MINIO_PORT_API')}",
+    aws_access_key_id=os.getenv("MINIO_ROOT_USER"),
+    aws_secret_access_key=os.getenv("MINIO_ROOT_PASSWORD"),
 )
 
-client = InfluxDBClient(url=INFLUX_CONFIG["url"], token=INFLUX_CONFIG["token"])
-# Use Batching instead of SYNCHRONOUS to ensure no data points are missed
-write_api = client.write_api(write_options=WriteOptions(
-    batch_size=5000,      # Send in chunks of 5000 rows
-    flush_interval=1000,  # Or every 1 second
-    retry_interval=5000,  # If it fails, wait 5s to retry
-    max_retries=3
-))
+client = InfluxDBClient(
+    url=f"http://{os.getenv('SERVER_IP')}:{os.getenv('INFLUXDB_PORT')}",
+    token=os.getenv("INFLUXDB_ROOT_TOKEN"),
+    org="my-class",
+)
+
+
+def error_callback(conf, data, exception):
+    print(f"FAILED TO WRITE BATCH: {exception}")
+
+
+write_api = client.write_api(
+    write_options=WriteOptions(
+        batch_size=2000,
+        flush_interval=1000,
+        retry_interval=5000,
+    ),
+    success_callback=lambda c, d: print("Batch written!"),
+    error_callback=error_callback,
+)
+
 
 def get_processed_files():
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(LOG_FILE):
         return set()
-    with open(HISTORY_FILE, "r") as f:
+    with open(LOG_FILE, "r") as f:
         return set(line.strip() for line in f)
 
-def mark_as_processed(filename):
-    with open(HISTORY_FILE, "a") as f:
-        f.write(f"{filename}\n")
 
-def get_participant_info(metadata_json):
-    # Hardcoded defaults as a safety net
-    info = {"name": "Abdurrahman Ibrahim", "roll_number": "25100204"}
-    
-    if isinstance(metadata_json, list):
-        for entry in metadata_json:
-            # .strip() removes hidden spaces like "Name " -> "Name"
-            title = str(entry.get("title", "")).strip()
-            val = entry.get("value")
-            
-            if title == "Name" and val:
-                info["name"] = str(val).strip()
-            elif title == "Roll number" and val:
-                info["roll_number"] = str(val).strip()
-    return info
+def mark_as_processed(file_key):
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{file_key}\n")
 
-def ingest_data():
-    processed_files = get_processed_files()
-    response = s3.list_objects_v2(Bucket=MINIO_BUCKET)
-    
-    for obj in response.get('Contents', []):
-        file_key = obj['Key']
-        if file_key in processed_files or not file_key.endswith('.zip'):
+
+def load_mappings():
+    if os.path.exists(MAPPING_FILE):
+        with open(MAPPING_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_mappings(mappings):
+    with open(MAPPING_FILE, "w") as f:
+        json.dump(mappings, f, indent=4)
+
+
+def parse_zip_name(filename):
+    parts = filename.replace(".zip", "").split("-")
+    device_id = parts[-1]
+    return device_id.replace("-", "")
+
+
+def extract_email_from_study_metadata(zip_file):
+    email = "UNKNOWN"
+
+    if "StudyMetadata.json" not in zip_file.namelist():
+        return email
+
+    with zip_file.open("StudyMetadata.json") as f:
+        meta = json.load(f)
+
+    for entry in meta:
+        title = str(entry.get("title", "")).strip().lower()
+        if title == "email":
+            email = str(entry.get("value", "")).strip()
+            break
+
+    return email.lower()
+
+
+def update_mapping(device_id, email):
+    email = email.lower()
+    mappings = load_mappings()
+    if mappings.get(device_id) != email:
+        mappings[device_id] = email
+        save_mappings(mappings)
+
+
+def write_sensor_csvs_from_zip(zip_file, device_id, email):
+    for csv_file in zip_file.namelist():
+        if not csv_file.endswith(".csv") or "Metadata" in csv_file:
             continue
-            
-        print(f"Ingesting ALL points from: {file_key}")
-        zip_data = s3.get_object(Bucket=MINIO_BUCKET, Key=file_key)
-        
-        try:
-            with zipfile.ZipFile(io.BytesIO(zip_data['Body'].read())) as z:
-                with z.open('StudyMetadata.json') as f:
-                    participant = get_participant_info(json.load(f))
 
-                for filename in z.namelist():
-                    if filename.endswith('.csv') and "Metadata" not in filename:
-                        if z.getinfo(filename).file_size == 0: continue
-                        
-                        measurement = filename.replace('.csv', '')
-                        with z.open(filename) as f:
-                            try:
-                                # Low memory mode helps with large CSVs on 16GB RAM
-                                df = pd.read_csv(f, low_memory=False)
-                                if df.empty: continue
+        measurement = csv_file.replace(".csv", "")
 
-                                # Data Prep
-                                df['time'] = pd.to_datetime(df['time'], unit='ns')
-                                df['name'] = participant['name']
-                                df['roll_number'] = participant['roll_number']
-                                df['file_key'] = file_key
-                                
-                                # WRITE ALL DATA
-                                write_api.write(
-                                    bucket=INFLUX_CONFIG["bucket"],
-                                    org=INFLUX_CONFIG["org"],
-                                    record=df,
-                                    data_frame_measurement_name=measurement,
-                                    data_frame_tag_columns=['name', 'roll_number', 'file_key'],
-                                    data_frame_timestamp_column='time'
-                                )
-                            except Exception as e:
-                                print(f"  Error in {filename}: {e}")
-                                continue
-                
-                # IMPORTANT: Wait for the buffer to clear before marking as processed
-                write_api.flush() 
-                mark_as_processed(file_key)
-                print(f"Successfully ingested {file_key} for {participant['name']}")
+        with zip_file.open(csv_file) as f:
+            try:
+                df = pd.read_csv(f)
+            except Exception as e:
+                print(f"Error reading CSV {csv_file}: {e}")
+                continue
 
-        except Exception as e:
-            print(f"Critical error processing {file_key}: {e}")
+        if df.empty:
+            continue
+
+        if "utc_time" not in df.columns:
+            print(f"Skipping {csv_file}: no utc_time column")
+            continue
+
+        df["time"] = df["utc_time"].apply(dateutil.parser.isoparse)
+        df.drop("utc_time", axis=1, inplace=True)
+
+        df["deviceId"] = device_id
+        df["email"] = email
+
+        for col in df.columns:
+            if col not in ["time", "deviceId", "email"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
+
+        print(f"Writing to InfluxDB: {measurement.lower()}")
+        print(device_id, email, measurement.lower(), "\n", df.head())
+
+        write_api.write(
+            bucket="sensor-data",
+            record=df,
+            data_frame_measurement_name=measurement.lower(),
+            data_frame_tag_columns=["deviceId", "email"],
+            data_frame_timestamp_column="time",
+        )
+
+
+def should_process_object(file_key, last_modified=None, processed_files=None):
+    if not file_key.endswith(".zip"):
+        return False
+
+    if processed_files is not None and file_key in processed_files:
+        return False
+
+    if last_modified is not None and last_modified < START_FILTER_DATE:
+        return False
+
+    return True
+
+
+def process_object(file_key, bucket_name=BUCKET_NAME, skip_if_processed=True):
+    processed_files = get_processed_files()
+
+    if skip_if_processed and file_key in processed_files:
+        print(f"Skipping already processed file: {file_key}")
+        return {"ok": True, "skipped": True, "reason": "already_processed", "file_key": file_key}
+
+    if not file_key.endswith(".zip"):
+        print(f"Skipping non-zip object: {file_key}")
+        return {"ok": True, "skipped": True, "reason": "not_zip", "file_key": file_key}
+
+    print(f"Processing ZIP: {file_key}")
+    device_id = parse_zip_name(file_key)
+    print(f"Device ID: {device_id}")
+
+    zip_obj = s3.get_object(Bucket=bucket_name, Key=file_key)
+
+    with zipfile.ZipFile(io.BytesIO(zip_obj["Body"].read())) as z:
+        email = extract_email_from_study_metadata(z)
+        update_mapping(device_id, email)
+        write_sensor_csvs_from_zip(z, device_id, email)
+
+    mark_as_processed(file_key)
+    print(f"Done: {file_key} mapped to {email}")
+
+    return {
+        "ok": True,
+        "skipped": False,
+        "file_key": file_key,
+        "device_id": device_id,
+        "email": email,
+    }
+
+
+def process_all_new_files(bucket_name=BUCKET_NAME):
+    processed_files = get_processed_files()
+    response = s3.list_objects_v2(Bucket=bucket_name)
+
+    results = []
+
+    for obj in response.get("Contents", []):
+        file_key = obj["Key"]
+        last_modified = obj["LastModified"]
+
+        if not should_process_object(
+            file_key=file_key,
+            last_modified=last_modified,
+            processed_files=processed_files,
+        ):
+            continue
+
+        result = process_object(
+            file_key=file_key,
+            bucket_name=bucket_name,
+            skip_if_processed=True,
+        )
+        results.append(result)
+
+    return results
+
+
+def close_connections():
+    print("Flushing buffers and closing connections...")
+    write_api.flush()
+    write_api.close()
+    client.close()
+    print("Safe to exit.")
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file-key", help="Single MinIO object key to process")
+    parser.add_argument("--bucket", default=BUCKET_NAME, help="MinIO bucket name")
+    args = parser.parse_args()
+
     try:
-        ingest_data()
+        if args.file_key:
+            result = process_object(args.file_key, bucket_name=args.bucket)
+            print(json.dumps(result, indent=2))
+        else:
+            results = process_all_new_files(bucket_name=args.bucket)
+            print(json.dumps(results, indent=2))
+    except Exception as e:
+        print(f"Error during ingestion: {e}")
+        raise
     finally:
-        print("Shutting down... ensuring all data points are sent.")
-        # 1. Force the write_api to send anything remaining in the buffer
-        write_api.flush()
-        
-        # 2. Close the write_api to stop the background threads gracefully
-        write_api.close()
-        
-        # 3. Close the main client connection
-        client.close()
-        print("Shutdown complete. All batches processed.")
+        close_connections()
