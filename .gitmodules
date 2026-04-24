@@ -1,0 +1,7 @@
+[submodule "webportal"]
+  path = webportal
+  url = https://github.com/SYSNET-LUMS/ddh-webportal.git
+
+[submodule "webportal-backend"]
+  path = webportal-backend
+  url = https://github.com/SYSNET-LUMS/ddh-webportal-backend.git

@@ -1,5 +1,6 @@
 .*
 !.gitignore
+!.gitmodules
 minio-bin
 minio/data/*
 .env
